@@ -47,20 +47,28 @@ namespace R1Engine {
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool IsWow64Process(IntPtr hProcess, out bool wow64Process);
 #elif ISLINUX
-        // It so happens that the one syscall needed here is still "TODO" in
-        // Mono.Posix.NETStandard, so here's a manual wrapping...
-        [DllImport("libc", SetLastError = true)]
-        public static extern c_long ptrace(c_uint request, pid_t pid, c_ptr addr, c_ptr data);
-        
-        // This one's available in Mono.Unix.Native, but why bother with that
-        // when I've already manually wrapped the most important one?
-        [DllImport("libc", SetLastError = true)]
-        public static extern pid_t waitpid(pid_t pid, out int status, int options);
+        // Taken from https://dev.to/v0idzz/linux-memory-manipulation-using-net-core-53ce
+        [StructLayout(LayoutKind.Sequential)]
+        unsafe struct iovec {
+            public void* iov_base;
+            public c_long iov_len;
+        }
 
-        static c_uint PTRACE_PEEKDATA = 2;
-        static c_uint PTRACE_POKEDATA = 5;
-        static c_uint PTRACE_ATTACH = 16;
-        static c_uint PTRACE_DETACH = 17;
+        [DllImport("libc")]
+        private static extern unsafe c_long process_vm_readv(int pid,
+                iovec* local_iov,
+                c_ptr liovcnt,
+                iovec* remote_iov,
+                c_ptr riovcnt,
+                c_ptr flags);
+
+        [DllImport("libc")]
+        private static extern unsafe c_long process_vm_writev(int pid,
+                iovec* local_iov,
+                c_ptr liovcnt,
+                iovec* remote_iov,
+                c_ptr riovcnt,
+                c_ptr flags);
 #endif
 
         const int PROCESS_ALL_ACCESS = 0x1F0FFF;
@@ -270,62 +278,33 @@ namespace R1Engine {
                 return 0;
             }
 #elif ISLINUX
-            // TODO: Do we need to worry about alignment here?
-            // According to the man page, that only matters for
-            // PTRACE_{PEEK,POKE}USER, whereas here we're using DATA...
-            // If it blows up for someone using ARM, we'll know why!
-            c_ptr wordSize = sizeof(c_long);
-            c_ptr numWords = (c_ptr)count / wordSize;
-            c_ptr numLeftOverBytes = (c_ptr)count % wordSize;
-            c_ptr numWordsRead;
-            if (numLeftOverBytes > 0)
-                numWords++;
-            c_long[] tempBuf = new c_long[numWords];
+            int numBytesRead = 0;
 
-            int errno = -(int)ptrace(PTRACE_ATTACH, process.Id, 0, 0);
-            if (errno == 1)
-                throw new UnauthorizedAccessException("Can't attach to process – you probably need to run 'sudo setcap cap_sys_ptrace=eip /path/to/Unity' (note that this will theoretically allow any Unity game you run to access/modify arbitrary processes' memory! You might want to unset cap_sys_ptrace before running untrusted games.)");
-            else if (errno == 3)
-                throw new FileNotFoundException("Process Not Found – it may have exited");
-            else if (errno != 0)
-                // Something bad happened, but we don't know what...
-                return 0;
+            unsafe {
+                // Based on https://dev.to/v0idzz/linux-memory-manipulation-using-net-core-53ce
+                var tempBuf = stackalloc byte[count];
+                var localIo = new iovec {
+                    iov_base = tempBuf,
+                    iov_len = count
+                };
+                var remoteIo = new iovec {
+                    iov_base = (void*)currentAddress,
+                    iov_len = count
+                };
 
-            int status;
-            errno = waitpid(process.Id, out status, 0);
-            if ((status & 0x7f) == 0) 
-                throw new EndOfStreamException("Process has exited");
+                numBytesRead = (int)process_vm_readv(process.Id, &localIo, 1, &remoteIo, 1, 0);
 
-            for(numWordsRead = 0; numWordsRead < numWords; numWordsRead++) {
-                tempBuf[numWordsRead] = ptrace(PTRACE_PEEKDATA,
-                        process.Id,
-                        (c_ptr)currentAddress + numWordsRead*wordSize,
-                        0);
-                errno = Marshal.GetLastWin32Error();
-                if (errno != 0) {
-                    // Tidy up.
-                    ptrace(PTRACE_DETACH, process.Id, 0, 0);
-                    if (errno == 5)
-                        throw new IOException("Tried to read from invalid/misaligned location in process memory");
-                    else if (errno == 14)
-                        throw new AccessViolationException("Tried to read from invalid location in process memory");
-                    else
-                        // Something bad happened, but we don't know what...
-                        break;
+                if (numBytesRead > 0) {
+                    Seek(numBytesRead, SeekOrigin.Current);
+                    fixed (byte* pBuffer = buffer) {
+                        for (int i=0; i<numBytesRead; i++) {
+                            pBuffer[offset+i] = tempBuf[i];
+                        }
+                    }
+                    return numBytesRead;
+                } else {
+                    return 0;
                 }
-            }
-
-            ptrace(PTRACE_DETACH, process.Id, 0, 0);
-
-            if (numWordsRead != 0) {
-                int numBytesRead = (int)(numWordsRead * wordSize);
-                if (numBytesRead > count)
-                    numBytesRead = count;
-                Seek(numBytesRead, SeekOrigin.Current);
-                Buffer.BlockCopy(tempBuf, 0, buffer, offset, numBytesRead);
-                return numBytesRead;
-            } else {
-                return 0;
             }
 #else
             throw new NotImplementedException();
@@ -369,77 +348,30 @@ namespace R1Engine {
                 Seek(numBytesWritten.ToUInt32(), SeekOrigin.Current);
             }
 #elif ISLINUX
-            // TODO: Do we need to worry about alignment here?
-            // According to the man page, that only matters for
-            // PTRACE_{PEEK,POKE}USER, whereas here we're using DATA...
-            // If it blows up for someone using ARM, we'll know why!
-            c_ptr wordSize = sizeof(c_long);
-            c_ptr numWords = (c_ptr)count / wordSize;
-            c_ptr numLeftoverBytes = (c_ptr)count % wordSize;
-            c_ptr numWordsWritten;
-            c_long[] tempBuf = new c_long[(numLeftoverBytes > 0) ? numWords+1 : numWords];
-            
-            int errno = -(int)ptrace(PTRACE_ATTACH, process.Id, 0, 0);
-            if (errno == 1)
-                throw new UnauthorizedAccessException("Can't attach to process – you probably need to run 'sudo setcap cap_sys_ptrace=eip /path/to/Unity' (note that this will theoretically allow any Unity game you run to access/modify arbitrary processes' memory! You might want to unset cap_sys_ptrace before running untrusted games.)");
-            else if (errno == 3)
-                throw new FileNotFoundException("Process Not Found – it may have exited");
-            else if (errno != 0)
-                // Something bad happened, but we don't know what...
-                return;
+            int numBytesWritten = 0;
 
-            int status;
-            errno = waitpid(process.Id, out status, 0);
-            if ((status & 0x7f) == 0) 
-                throw new EndOfStreamException("Process has exited");
-
-            if (numLeftoverBytes > 0) {
-                // Get the last word from memory so we only overwrite the bytes we care about!
-                tempBuf[numWords] = ptrace(PTRACE_PEEKDATA,
-                        process.Id,
-                        (c_ptr)currentAddress + numWords*wordSize,
-                        0);
-                errno = Marshal.GetLastWin32Error();
-                if (errno != 0) {
-                    // Tidy up.
-                    ptrace(PTRACE_DETACH, process.Id, 0, 0);
-                    if (errno == 5)
-                        throw new IOException("Tried to read from invalid/misaligned location in process memory");
-                    else if (errno == 14)
-                        throw new AccessViolationException("Tried to read from invalid location in process memory");
-                    else
-                        // Something bad happened, but we don't know what...
-                        return;
+            unsafe {
+                var tempBuf = stackalloc byte[count];
+                fixed (byte* pBuffer = buffer) {
+                    for (int i=0; i<count; i++) {
+                        tempBuf[i] = pBuffer[offset+i];
+                    }
                 }
 
-                numWords++;
+                // Based on https://dev.to/v0idzz/linux-memory-manipulation-using-net-core-53ce
+                var localIo = new iovec {
+                    iov_base = tempBuf,
+                    iov_len = count
+                };
+                var remoteIo = new iovec {
+                    iov_base = (void*)currentAddress,
+                    iov_len = count
+                };
+
+                numBytesWritten = (int)process_vm_writev(process.Id, &localIo, 1, &remoteIo, 1, 0);
             }
 
-            Buffer.BlockCopy(buffer, offset, tempBuf, 0, count);
-
-            for(numWordsWritten = 0; numWordsWritten < numWords; numWordsWritten++) {
-                ptrace(PTRACE_POKEDATA,
-                        process.Id,
-                        (c_ptr)currentAddress + numWordsWritten*wordSize,
-                        (c_ptr)tempBuf[numWordsWritten]);
-                errno = Marshal.GetLastWin32Error();
-                if (errno != 0) {
-                    // Tidy up.
-                    ptrace(PTRACE_DETACH, process.Id, 0, 0);
-                    if (errno == 5)
-                        throw new IOException("Tried to write from invalid/misaligned location in process memory");
-                    else if (errno == 14)
-                        throw new AccessViolationException("Tried to write from invalid location in process memory");
-                    else
-                        // Something bad happened, but we don't know what...
-                        break;
-                }
-            }
-
-            ptrace(PTRACE_DETACH, process.Id, 0, 0);
-
-            if (numWordsWritten != 0) {
-                int numBytesWritten = (int)(numWordsWritten * wordSize);
+            if (numBytesWritten > 0) {
                 if (numBytesWritten > count)
                     numBytesWritten = count;
                 Seek(numBytesWritten, SeekOrigin.Current);
@@ -463,10 +395,6 @@ namespace R1Engine {
 #endif
 #if (ISWINDOWS || ISLINUX)
             if (process != null) {
-#if ISLINUX
-                // Just in case...
-                ptrace(PTRACE_DETACH, process.Id, 0, 0);
-#endif
                 process.Dispose();
                 process = null;
             }
